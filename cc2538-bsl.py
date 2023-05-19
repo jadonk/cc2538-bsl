@@ -137,7 +137,7 @@ class FirmwareFile(object):
             if file_type == 'text/plain':
                 firmware_is_hex = True
                 mdebug(5, "Firmware file: Intel Hex")
-            elif file_type == 'application/octet-stream':
+            elif file_type == 'application/octet-stream' or file_type == 'application/x-dosexec':
                 mdebug(5, "Firmware file: Raw Binary")
             else:
                 error_str = "Could not determine firmware type. Magic " \
@@ -216,7 +216,17 @@ class CommandInterface(object):
 
         self.sp.open()
 
-    def invoke_bootloader(self, dtr_active_high=False, inverted=False):
+    def invoke_bootloader(self, dtr_active_high=False, inverted=False, send_break=False):
+        if send_break:
+            # Use send_break on BeagleConnect Freedom to trigger BSL
+            print("Sending break")
+            to = self.sp.timeout
+            self.sp.timeout = .1
+            self.sp.send_break()
+            self.sp.read(100)
+            self.sp.timeout = to
+            return
+
         # Use the DTR and RTS lines to control bootloader and the !RESET pin.
         # This can automatically invoke the bootloader without the user
         # having to toggle any pins.
@@ -819,6 +829,8 @@ class CC26xx(Chip):
         protocols = user_id[1] >> 4
 
         # We can now detect the exact device
+        print("pg_rev = %0x, protocols = %0x, wafer_id = 0x%04x" % (pg_rev, protocols, wafer_id))
+
         if wafer_id == 0xB99A:
             chip = self._identify_cc26xx(pg_rev, protocols)
         elif wafer_id == 0xB9BE:
@@ -826,6 +838,16 @@ class CC26xx(Chip):
         elif wafer_id == 0xBB41:
             chip = self._identify_cc13xx(pg_rev, protocols)
             self.page_size = 8192
+        elif wafer_id == 0xBB77:
+            # CC1352P7
+            chip = self._identify_cc13xx(pg_rev, protocols)
+            self.page_size = 8192
+        else:
+            # CC1352P7 TRM (https://www.ti.com/lit/pdf/swcu192) does not specify the SEQUENCE
+            # in table 11-59, so I need an actual device to test it
+            chip = self._identify_cc13xx(pg_rev, protocols)
+            self.page_size = 8192
+
 
         # Read flash size, calculate and store bootloader disable address
         self.size = self.command_interface.cmdMemReadCC26xx(
@@ -889,18 +911,22 @@ class CC26xx(Chip):
         return "%s %s" % (chip_str, pg_str)
 
     def _identify_cc13xx(self, pg, protocols):
-        chip_str = "CC1310"
+        chip_str = "CC131x"
         if protocols & CC26xx.PROTO_MASK_IEEE == CC26xx.PROTO_MASK_IEEE:
-            chip_str = "CC1350"
+            chip_str = "CC135x"
 
         if pg == 0:
             pg_str = "PG1.0"
+        if pg == 1:
+            pg_str = "PG1.1"
         elif pg == 2 or pg == 3:
             rev_minor = self.command_interface.cmdMemReadCC26xx(
                                                 CC26xx.MISC_CONF_1)[0]
             if rev_minor == 0xFF:
                 rev_minor = 0x00
             pg_str = "PG2.%d" % (rev_minor,)
+        else:
+            pg_str = "PG1.0"
 
         return "%s %s" % (chip_str, pg_str)
 
@@ -1021,7 +1047,8 @@ def print_version():
 
 def usage():
     print("""Usage: %s [-DhqVfewvr] [-l length] [-p port] [-b baud] [-a addr] \
-    [-i addr] [--bootloader-active-high] [--bootloader-invert-lines] [file.bin]
+    [-i addr] [--bootloader-active-high] [--bootloader-invert-lines] \
+    [--bootloader-send-break] [--append .ext] [file.bin]
     -h, --help                   This help
     -q                           Quiet
     -V                           Verbose
@@ -1038,9 +1065,11 @@ def usage():
     -p port                      Serial port (default: first USB-like port in /dev)
     -b baud                      Baud speed (default: 500000)
     -a addr                      Target address
+    --append ext                 Add string to the end of the filename
     -i, --ieee-address addr      Set the secondary 64 bit IEEE address
     --bootloader-active-high     Use active high signals to enter bootloader
     --bootloader-invert-lines    Inverts the use of RTS and DTR to enter bootloader
+    --bootloader-send-break      Use break signal to enter bootloader
     -D, --disable-bootloader     After finishing, disable the bootloader
     --version                    Print script version
 
@@ -1065,21 +1094,25 @@ if __name__ == "__main__":
             'read': 0,
             'len': 0x80000,
             'fname': '',
+            'append': '',
             'ieee_address': 0,
             'bootloader_active_high': False,
             'bootloader_invert_lines': False,
+            'bootloader_send_break': False,
             'disable-bootloader': 0
         }
 
 # http://www.python.org/doc/2.5.2/lib/module-getopt.html
 
     try:
-        opts, args = getopt.getopt(sys.argv[1:],
+        opts, args = getopt.gnu_getopt(sys.argv[1:],
                                    "DhqVfeE:wvrp:b:a:l:i:",
                                    ['help', 'ieee-address=','erase-page=',
+                                    'append=',
                                     'disable-bootloader',
                                     'bootloader-active-high',
-                                    'bootloader-invert-lines', 'version'])
+                                    'bootloader-invert-lines',
+                                    'bootloader-send-break', 'version'])
     except getopt.GetoptError as err:
         # print help information and exit:
         print(str(err))  # will print something like "option -a not recognized"
@@ -1094,6 +1127,8 @@ if __name__ == "__main__":
         elif o == '-h' or o == '--help':
             usage()
             sys.exit(0)
+        elif o == '--append':
+            conf['append'] = str(a)
         elif o == '-f':
             conf['force'] = 1
         elif o == '-e':
@@ -1121,8 +1156,13 @@ if __name__ == "__main__":
             conf['bootloader_active_high'] = True
         elif o == '--bootloader-invert-lines':
             conf['bootloader_invert_lines'] = True
+        elif o == '--bootloader-send-break':
+            print("Got send break")
+            conf['bootloader_send_break'] = True
         elif o == '-D' or o == '--disable-bootloader':
             conf['disable-bootloader'] = 1
+        elif o == '-E' or o == '--erase-page':
+            conf['erase_page'] = str(a)
         elif o == '--version':
             print_version()
             sys.exit(0)
@@ -1134,9 +1174,14 @@ if __name__ == "__main__":
         # check for input/output file
         if conf['write'] or conf['read'] or conf['verify']:
             try:
-                args[0]
+                if conf['append']:
+                    conf['fname'] = args[0] + conf['append']
+                else:
+                    conf['fname'] = args[0]
             except:
                 raise Exception('No file path given.')
+            mdebug(5, "Setting filename to %s"
+                   % (conf['fname']))
 
         if conf['write'] and conf['read']:
             if not (conf['force'] or
@@ -1179,13 +1224,14 @@ if __name__ == "__main__":
 
         cmd = CommandInterface()
         cmd.open(conf['port'], conf['baud'])
-        cmd.invoke_bootloader(conf['bootloader_active_high'],
-                              conf['bootloader_invert_lines'])
+        cmd.invoke_bootloader(dtr_active_high=conf['bootloader_active_high'],
+                              inverted=conf['bootloader_invert_lines'],
+                              send_break=conf['bootloader_send_break'])
         mdebug(5, "Opening port %(port)s, baud %(baud)d"
                % {'port': conf['port'], 'baud': conf['baud']})
         if conf['write'] or conf['verify']:
-            mdebug(5, "Reading data from %s" % args[0])
-            firmware = FirmwareFile(args[0])
+            mdebug(5, "Reading data from %s" % conf['fname'])
+            firmware = FirmwareFile(conf['fname'])
 
         mdebug(5, "Connecting to target...")
 
@@ -1285,7 +1331,7 @@ if __name__ == "__main__":
 
             mdebug(5, "Reading %s bytes starting at address 0x%x"
                    % (length, conf['address']))
-            with open(args[0], 'wb') as f:
+            with open(conf['fname'], 'wb') as f:
                 for i in range(0, length >> 2):
                     # reading 4 bytes at a time
                     rdata = device.read_memory(conf['address'] + (i * 4))
